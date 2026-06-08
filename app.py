@@ -21,7 +21,7 @@ TICKER_EUR = "28K1.F"       # BigBear.ai in euro - Frankfurt
 TICKER_USD = "BBAI"         # fallback USA
 FX_TICKER = "EURUSD=X"
 
-# Usiamo VIXY invece di ^VIX perché ^VIX spesso dà problemi con yfinance.
+# VIXY è usato come proxy della volatilità perché ^VIX spesso dà problemi con yfinance.
 SECTOR_TICKERS = {
     "QQQ": "Nasdaq / tecnologia growth",
     "IWM": "Small cap USA",
@@ -341,14 +341,14 @@ def convert_usd_df_to_eur(df, eurusd):
 
 
 def get_price_source():
-    eur_df = download_data(TICKER_EUR, "5d", "15m")
+    eur_df = download_data(TICKER_EUR, "10d", "15m")
 
     if not eur_df.empty:
         last_price = float(eur_df["Close"].iloc[-1])
         return last_price, "Automatico da ticker europeo 28K1.F", eur_df
 
     fx = get_eurusd()
-    usd_df = download_data(TICKER_USD, "5d", "15m")
+    usd_df = download_data(TICKER_USD, "10d", "15m")
 
     if fx and not usd_df.empty:
         usd_df = convert_usd_df_to_eur(usd_df, fx)
@@ -379,18 +379,22 @@ def resample_4h(df_1h):
 
 
 def get_tf_data():
-    df_15m = download_data(TICKER_EUR, "5d", "15m")
-    df_1h = download_data(TICKER_EUR, "1mo", "1h")
-    df_1d = download_data(TICKER_EUR, "6mo", "1d")
+    """
+    Scarica più storico rispetto alla prima versione.
+    Questo serve soprattutto per far funzionare il 4h, che nasce dal resample dell'1h.
+    """
+    df_15m = download_data(TICKER_EUR, "10d", "15m")
+    df_1h = download_data(TICKER_EUR, "3mo", "1h")
+    df_1d = download_data(TICKER_EUR, "1y", "1d")
 
     source = "28K1.F"
 
     if df_15m.empty or df_1h.empty or df_1d.empty:
         fx = get_eurusd()
 
-        df_15m = download_data(TICKER_USD, "5d", "15m")
-        df_1h = download_data(TICKER_USD, "1mo", "1h")
-        df_1d = download_data(TICKER_USD, "6mo", "1d")
+        df_15m = download_data(TICKER_USD, "10d", "15m")
+        df_1h = download_data(TICKER_USD, "3mo", "1h")
+        df_1d = download_data(TICKER_USD, "1y", "1d")
 
         if fx and not df_15m.empty and not df_1h.empty and not df_1d.empty:
             df_15m = convert_usd_df_to_eur(df_15m, fx)
@@ -497,6 +501,9 @@ def technical_score(df):
 
 def analyze_timeframe(df, label):
     df = add_indicators(df)
+
+    if df.empty or len(df) < 2:
+        raise ValueError(f"Dati insufficienti per {label}")
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -769,10 +776,23 @@ with st.spinner("Aggiorno prezzo, posizione, analisi tecnica e contesto di merca
 
     analyses = {}
 
+    min_candles = {
+        "15m": 50,
+        "30m": 40,
+        "1h": 50,
+        "4h": 25,
+        "1D": 60,
+    }
+
     if tf_data:
         for label, df in tf_data.items():
-            if not df.empty and len(df) >= 60:
-                analyses[label] = analyze_timeframe(df, label)
+            required = min_candles.get(label, 50)
+
+            if not df.empty and len(df) >= required:
+                try:
+                    analyses[label] = analyze_timeframe(df, label)
+                except Exception:
+                    pass
 
     technical_available = all(label in analyses for label in ["15m", "30m", "1h", "4h", "1D"])
     operational = build_operational_signal(analyses) if technical_available else None
@@ -1094,6 +1114,27 @@ if technical_available:
             c3.write(f"**Resistenza:** {fmt_eur_3(tf['resistance'])}")
             c3.write(f"**ATR:** {fmt_eur_3(tf['atr'])}")
             c3.write(f"**Forza tecnica:** {tf['score']}/5")
+
+else:
+    st.markdown('<div class="section-title">Analisi tecnica multi-timeframe</div>', unsafe_allow_html=True)
+
+    available_labels = list(analyses.keys())
+
+    if available_labels:
+        st.markdown(f"""
+        <div class="signal-box signal-yellow">
+            Alcuni dati tecnici sono stati caricati, ma non tutti i timeframe sono disponibili.
+            Timeframe disponibili: <b>{safe_text(", ".join(available_labels))}</b>.
+            Attendi qualche minuto e fai un nuovo refresh, oppure riduci i refresh consecutivi per evitare il rate limit di Yahoo Finance.
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div class="signal-box signal-yellow">
+            Al momento non sono disponibili dati sufficienti per costruire l’analisi tecnica.
+            Probabile rate limit temporaneo di Yahoo Finance. La parte posizione resta utilizzabile con il prezzo manuale Trade Republic.
+        </div>
+        """, unsafe_allow_html=True)
 
 
 # =========================================================
