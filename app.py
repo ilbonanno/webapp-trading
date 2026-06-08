@@ -3,6 +3,7 @@ from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -17,11 +18,9 @@ st.set_page_config(
     layout="wide"
 )
 
-TICKER_EUR = "28K1.F"       # BigBear.ai in euro - Frankfurt
-TICKER_USD = "BBAI"         # fallback USA
-FX_TICKER = "EURUSD=X"
+TICKER_USD = "BBAI"
+FX_SYMBOL = "EUR/USD"
 
-# VIXY è usato come proxy della volatilità perché ^VIX spesso dà problemi con yfinance.
 SECTOR_TICKERS = {
     "QQQ": "Nasdaq / tecnologia growth",
     "IWM": "Small cap USA",
@@ -73,13 +72,6 @@ st.markdown("""
     margin-bottom: 22px;
 }
 
-.card-grid-3 {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 18px;
-    margin-bottom: 22px;
-}
-
 .card {
     background: #ffffff;
     border: 1px solid #e5e7eb;
@@ -101,7 +93,6 @@ st.markdown("""
     color: #111827;
     line-height: 1.15;
     white-space: normal;
-    word-break: normal;
 }
 
 .card-value-small {
@@ -110,7 +101,6 @@ st.markdown("""
     color: #111827;
     line-height: 1.25;
     white-space: normal;
-    word-break: normal;
 }
 
 .positive {
@@ -119,10 +109,6 @@ st.markdown("""
 
 .negative {
     color: #b91c1c;
-}
-
-.neutral {
-    color: #374151;
 }
 
 .signal-box {
@@ -158,15 +144,8 @@ st.markdown("""
     color: #1e40af;
 }
 
-.small-note {
-    font-size: 14px;
-    color: #6b7280;
-    margin-top: -8px;
-    margin-bottom: 18px;
-}
-
 @media (max-width: 1100px) {
-    .card-grid-4, .card-grid-3 {
+    .card-grid-4 {
         grid-template-columns: 1fr;
     }
 
@@ -219,6 +198,17 @@ def safe_text(value):
 
 
 # =========================================================
+# API KEY TWELVE DATA
+# =========================================================
+
+def get_twelve_key():
+    try:
+        return st.secrets["TWELVE_DATA_API_KEY"]
+    except Exception:
+        return ""
+
+
+# =========================================================
 # FUNZIONI TECNICHE
 # =========================================================
 
@@ -231,10 +221,13 @@ def clean_df(df):
 
     df = df.dropna()
 
-    required_cols = ["Open", "High", "Low", "Close", "Volume"]
+    required_cols = ["Open", "High", "Low", "Close"]
     for col in required_cols:
         if col not in df.columns:
             return pd.DataFrame()
+
+    if "Volume" not in df.columns:
+        df["Volume"] = 0
 
     return df
 
@@ -301,11 +294,78 @@ def add_indicators(df):
 
 
 # =========================================================
-# DOWNLOAD DATI
+# DOWNLOAD DATI: TWELVE DATA + FALLBACK YAHOO
 # =========================================================
 
 @st.cache_data(ttl=600)
-def download_data(ticker, period, interval):
+def download_twelve_data(symbol, interval, outputsize=200):
+    api_key = get_twelve_key()
+
+    if not api_key:
+        return pd.DataFrame()
+
+    url = "https://api.twelvedata.com/time_series"
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": api_key,
+        "format": "JSON",
+        "order": "ASC"
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=20)
+        data = response.json()
+
+        if not isinstance(data, dict):
+            return pd.DataFrame()
+
+        if "values" not in data:
+            return pd.DataFrame()
+
+        rows = data["values"]
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+
+        if "datetime" not in df.columns:
+            return pd.DataFrame()
+
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.set_index("datetime").sort_index()
+
+        rename_map = {
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume"
+        }
+
+        df = df.rename(columns=rename_map)
+
+        for col in ["Open", "High", "Low", "Close"]:
+            if col not in df.columns:
+                return pd.DataFrame()
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "Volume" in df.columns:
+            df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+        else:
+            df["Volume"] = 0
+
+        return clean_df(df)
+
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600)
+def download_yahoo_data(ticker, period, interval):
     try:
         df = yf.download(
             ticker,
@@ -320,16 +380,6 @@ def download_data(ticker, period, interval):
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=900)
-def get_eurusd():
-    df = download_data(FX_TICKER, "5d", "1d")
-
-    if df.empty:
-        return None
-
-    return float(df["Close"].iloc[-1])
-
-
 def convert_usd_df_to_eur(df, eurusd):
     df = df.copy()
 
@@ -340,22 +390,76 @@ def convert_usd_df_to_eur(df, eurusd):
     return df
 
 
+@st.cache_data(ttl=900)
+def get_eurusd():
+    df = download_twelve_data(FX_SYMBOL, "1day", 10)
+
+    if not df.empty:
+        return float(df["Close"].iloc[-1]), "Twelve Data EUR/USD"
+
+    yahoo_fx = download_yahoo_data("EURUSD=X", "5d", "1d")
+
+    if not yahoo_fx.empty:
+        return float(yahoo_fx["Close"].iloc[-1]), "Yahoo EUR/USD fallback"
+
+    return None, "Cambio non disponibile"
+
+
 def get_price_source():
-    eur_df = download_data(TICKER_EUR, "10d", "15m")
+    eurusd, fx_source = get_eurusd()
 
-    if not eur_df.empty:
-        last_price = float(eur_df["Close"].iloc[-1])
-        return last_price, "Automatico da ticker europeo 28K1.F", eur_df
+    df = download_twelve_data(TICKER_USD, "15min", 200)
 
-    fx = get_eurusd()
-    usd_df = download_data(TICKER_USD, "10d", "15m")
+    if eurusd and not df.empty:
+        df_eur = convert_usd_df_to_eur(df, eurusd)
+        last_price = float(df_eur["Close"].iloc[-1])
+        return last_price, f"Twelve Data BBAI convertito EUR ({fx_source})", df_eur
 
-    if fx and not usd_df.empty:
-        usd_df = convert_usd_df_to_eur(usd_df, fx)
-        last_price = float(usd_df["Close"].iloc[-1])
-        return last_price, "Fallback BBAI USA convertito in euro", usd_df
+    yahoo_df = download_yahoo_data(TICKER_USD, "10d", "15m")
+
+    if eurusd and not yahoo_df.empty:
+        yahoo_df = convert_usd_df_to_eur(yahoo_df, eurusd)
+        last_price = float(yahoo_df["Close"].iloc[-1])
+        return last_price, f"Yahoo BBAI convertito EUR ({fx_source})", yahoo_df
 
     return None, "Dato automatico non disponibile", pd.DataFrame()
+
+
+def get_tf_data():
+    eurusd, fx_source = get_eurusd()
+
+    if not eurusd:
+        return {}, "Cambio EUR/USD non disponibile"
+
+    df_15m = download_twelve_data(TICKER_USD, "15min", 500)
+    df_1h = download_twelve_data(TICKER_USD, "1h", 500)
+    df_1d = download_twelve_data(TICKER_USD, "1day", 300)
+
+    source = f"Twelve Data BBAI convertito EUR ({fx_source})"
+
+    if df_15m.empty or df_1h.empty or df_1d.empty:
+        df_15m = download_yahoo_data(TICKER_USD, "10d", "15m")
+        df_1h = download_yahoo_data(TICKER_USD, "3mo", "1h")
+        df_1d = download_yahoo_data(TICKER_USD, "1y", "1d")
+        source = f"Yahoo BBAI convertito EUR ({fx_source})"
+
+    if df_15m.empty or df_1h.empty or df_1d.empty:
+        return {}, source
+
+    df_15m = convert_usd_df_to_eur(df_15m, eurusd)
+    df_1h = convert_usd_df_to_eur(df_1h, eurusd)
+    df_1d = convert_usd_df_to_eur(df_1d, eurusd)
+
+    df_30m = resample_30m(df_15m)
+    df_4h = resample_4h(df_1h)
+
+    return {
+        "15m": df_15m,
+        "30m": df_30m,
+        "1h": df_1h,
+        "4h": df_4h,
+        "1D": df_1d,
+    }, source
 
 
 def resample_30m(df_15m):
@@ -376,45 +480,6 @@ def resample_4h(df_1h):
     df["Close"] = df_1h["Close"].resample("4h").last()
     df["Volume"] = df_1h["Volume"].resample("4h").sum()
     return df.dropna()
-
-
-def get_tf_data():
-    """
-    Scarica più storico rispetto alla prima versione.
-    Questo serve soprattutto per far funzionare il 4h, che nasce dal resample dell'1h.
-    """
-    df_15m = download_data(TICKER_EUR, "10d", "15m")
-    df_1h = download_data(TICKER_EUR, "3mo", "1h")
-    df_1d = download_data(TICKER_EUR, "1y", "1d")
-
-    source = "28K1.F"
-
-    if df_15m.empty or df_1h.empty or df_1d.empty:
-        fx = get_eurusd()
-
-        df_15m = download_data(TICKER_USD, "10d", "15m")
-        df_1h = download_data(TICKER_USD, "3mo", "1h")
-        df_1d = download_data(TICKER_USD, "1y", "1d")
-
-        if fx and not df_15m.empty and not df_1h.empty and not df_1d.empty:
-            df_15m = convert_usd_df_to_eur(df_15m, fx)
-            df_1h = convert_usd_df_to_eur(df_1h, fx)
-            df_1d = convert_usd_df_to_eur(df_1d, fx)
-            source = "BBAI USA convertito EUR"
-
-    if df_15m.empty or df_1h.empty or df_1d.empty:
-        return {}, source
-
-    df_30m = resample_30m(df_15m)
-    df_4h = resample_4h(df_1h)
-
-    return {
-        "15m": df_15m,
-        "30m": df_30m,
-        "1h": df_1h,
-        "4h": df_4h,
-        "1D": df_1d,
-    }, source
 
 
 # =========================================================
@@ -598,7 +663,10 @@ def build_operational_signal(analysis):
 # =========================================================
 
 def analyze_market_asset(ticker, description):
-    df = download_data(ticker, "3mo", "1d")
+    df = download_twelve_data(ticker, "1day", 100)
+
+    if df.empty:
+        df = download_yahoo_data(ticker, "3mo", "1d")
 
     if df.empty or len(df) < 40:
         return {
@@ -636,7 +704,6 @@ def analyze_market_asset(ticker, description):
 
     score = 0
 
-    # Per VIXY la logica è inversa: se scende, il contesto è più risk-on.
     if ticker == "VIXY":
         if daily_change < 0:
             score += 1
@@ -761,7 +828,7 @@ manual_price = st.sidebar.number_input(
 
 st.sidebar.caption(
     "Se inserisci il prezzo manuale visto su Trade Republic, la webapp userà quello per calcolare guadagno/perdita. "
-    "Se lo lasci a zero, userà il prezzo automatico del ticker europeo o il fallback USA convertito in euro."
+    "Se lo lasci a zero, userà il prezzo automatico Twelve Data/Yahoo convertito in euro."
 )
 
 
@@ -815,7 +882,7 @@ else:
 
 st.markdown('<div class="main-title">BBAI – Dashboard posizione Trade Republic</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitle">Monitoraggio della posizione, utile/perdita in euro, contesto di mercato e analisi tecnica multi-timeframe su 15m, 30m, 1h, 4h e 1D.</div>',
+    '<div class="subtitle">Monitoraggio posizione, utile/perdita in euro, contesto di mercato e analisi tecnica multi-timeframe su 15m, 30m, 1h, 4h e 1D.</div>',
     unsafe_allow_html=True
 )
 
@@ -823,7 +890,7 @@ st.markdown(
 if current_price is None:
     st.markdown("""
     <div class="signal-box signal-yellow">
-        Il prezzo automatico non è disponibile in questo momento, probabilmente per rate limit di Yahoo Finance.
+        Il prezzo automatico non è disponibile in questo momento.
         Inserisci il prezzo attuale che vedi su Trade Republic nel campo laterale per calcolare comunque la posizione.
     </div>
     """, unsafe_allow_html=True)
@@ -951,8 +1018,8 @@ if operational is not None:
 else:
     st.markdown("""
     <div class="signal-box signal-yellow">
-        Analisi tecnica BBAI non disponibile in questo momento. Probabile rate limit o assenza temporanea di dati.
-        La parte posizione può comunque funzionare usando il prezzo manuale Trade Republic.
+        Analisi tecnica BBAI non disponibile in questo momento.
+        Verifica che la API key Twelve Data sia nei Secrets di Streamlit e attendi qualche minuto se hai fatto molti refresh.
     </div>
     """, unsafe_allow_html=True)
 
@@ -977,8 +1044,7 @@ if not market_df.empty:
     st.dataframe(market_df_view, use_container_width=True, hide_index=True)
 
 st.caption(
-    "La lettura del contesto confronta BBAI con Nasdaq, small cap USA, ETF AI/robotics, difesa e volatilità tramite VIXY. "
-    "Serve a capire se il mercato sta favorendo o ostacolando il trade."
+    "La lettura del contesto confronta BBAI con Nasdaq, small cap USA, ETF AI/robotics, difesa e volatilità tramite VIXY."
 )
 
 
@@ -1073,9 +1139,9 @@ if technical_available:
 # ANALISI MULTI-TIMEFRAME
 # =========================================================
 
-if technical_available:
-    st.markdown('<div class="section-title">Analisi tecnica multi-timeframe</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Analisi tecnica multi-timeframe</div>', unsafe_allow_html=True)
 
+if technical_available:
     summary_rows = []
 
     for label in ["15m", "30m", "1h", "4h", "1D"]:
@@ -1116,8 +1182,6 @@ if technical_available:
             c3.write(f"**Forza tecnica:** {tf['score']}/5")
 
 else:
-    st.markdown('<div class="section-title">Analisi tecnica multi-timeframe</div>', unsafe_allow_html=True)
-
     available_labels = list(analyses.keys())
 
     if available_labels:
@@ -1125,14 +1189,13 @@ else:
         <div class="signal-box signal-yellow">
             Alcuni dati tecnici sono stati caricati, ma non tutti i timeframe sono disponibili.
             Timeframe disponibili: <b>{safe_text(", ".join(available_labels))}</b>.
-            Attendi qualche minuto e fai un nuovo refresh, oppure riduci i refresh consecutivi per evitare il rate limit di Yahoo Finance.
         </div>
         """, unsafe_allow_html=True)
     else:
         st.markdown("""
         <div class="signal-box signal-yellow">
             Al momento non sono disponibili dati sufficienti per costruire l’analisi tecnica.
-            Probabile rate limit temporaneo di Yahoo Finance. La parte posizione resta utilizzabile con il prezzo manuale Trade Republic.
+            Controlla che la API key Twelve Data sia stata salvata correttamente nei Secrets.
         </div>
         """, unsafe_allow_html=True)
 
@@ -1144,7 +1207,7 @@ else:
 st.caption(
     f"Ultimo aggiornamento: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} — "
     f"Fonte tecnica: {tf_source if 'tf_source' in globals() else 'non disponibile'}. "
-    "La fonte automatica usa il ticker europeo 28K1.F quando disponibile. "
+    "La webapp usa Twelve Data come fonte principale e Yahoo Finance come fallback. "
     "Per la massima aderenza a Trade Republic puoi inserire manualmente il prezzo attuale visto sul broker. "
     "Le indicazioni sono basate su analisi tecnica e non costituiscono consulenza finanziaria personalizzata."
 )
