@@ -21,13 +21,14 @@ TICKER_EUR = "28K1.F"       # BigBear.ai in euro - Frankfurt
 TICKER_USD = "BBAI"         # fallback USA
 FX_TICKER = "EURUSD=X"
 
+# Usiamo VIXY invece di ^VIX perché ^VIX spesso dà problemi con yfinance.
 SECTOR_TICKERS = {
     "QQQ": "Nasdaq / tecnologia growth",
     "IWM": "Small cap USA",
     "BOTZ": "Robotics & AI",
     "AIQ": "Artificial Intelligence",
     "ITA": "Aerospace & Defense",
-    "^VIX": "Volatilità mercato"
+    "VIXY": "Volatilità mercato"
 }
 
 
@@ -228,7 +229,14 @@ def clean_df(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    return df.dropna()
+    df = df.dropna()
+
+    required_cols = ["Open", "High", "Low", "Close", "Volume"]
+    for col in required_cols:
+        if col not in df.columns:
+            return pd.DataFrame()
+
+    return df
 
 
 def ema(series, length):
@@ -296,7 +304,7 @@ def add_indicators(df):
 # DOWNLOAD DATI
 # =========================================================
 
-@st.cache_data(ttl=180)
+@st.cache_data(ttl=600)
 def download_data(ticker, period, interval):
     try:
         df = yf.download(
@@ -304,14 +312,15 @@ def download_data(ticker, period, interval):
             period=period,
             interval=interval,
             progress=False,
-            auto_adjust=True
+            auto_adjust=True,
+            threads=False
         )
         return clean_df(df)
     except Exception:
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=900)
 def get_eurusd():
     df = download_data(FX_TICKER, "5d", "1d")
 
@@ -346,7 +355,7 @@ def get_price_source():
         last_price = float(usd_df["Close"].iloc[-1])
         return last_price, "Fallback BBAI USA convertito in euro", usd_df
 
-    return None, "Dato non disponibile", pd.DataFrame()
+    return None, "Dato automatico non disponibile", pd.DataFrame()
 
 
 def resample_30m(df_15m):
@@ -383,7 +392,7 @@ def get_tf_data():
         df_1h = download_data(TICKER_USD, "1mo", "1h")
         df_1d = download_data(TICKER_USD, "6mo", "1d")
 
-        if fx:
+        if fx and not df_15m.empty and not df_1h.empty and not df_1d.empty:
             df_15m = convert_usd_df_to_eur(df_15m, fx)
             df_1h = convert_usd_df_to_eur(df_1h, fx)
             df_1d = convert_usd_df_to_eur(df_1d, fx)
@@ -597,6 +606,17 @@ def analyze_market_asset(ticker, description):
 
     df = add_indicators(df)
 
+    if df.empty or len(df) < 2:
+        return {
+            "Ticker": ticker,
+            "Settore": description,
+            "Variazione oggi": "-",
+            "Trend breve": "Dato non disponibile",
+            "RSI": "-",
+            "Lettura": "Neutrale",
+            "Score": 0
+        }
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -609,7 +629,8 @@ def analyze_market_asset(ticker, description):
 
     score = 0
 
-    if ticker == "^VIX":
+    # Per VIXY la logica è inversa: se scende, il contesto è più risk-on.
+    if ticker == "VIXY":
         if daily_change < 0:
             score += 1
         if current_price < float(last["EMA20"]):
@@ -700,7 +721,8 @@ entry_price = st.sidebar.number_input(
     min_value=0.0,
     value=0.0,
     step=0.01,
-    format="%.3f"
+    format="%.3f",
+    key="entry_price_input"
 )
 
 capital = st.sidebar.number_input(
@@ -708,7 +730,8 @@ capital = st.sidebar.number_input(
     min_value=0.0,
     value=0.0,
     step=50.0,
-    format="%.2f"
+    format="%.2f",
+    key="capital_input"
 )
 
 manual_quantity = st.sidebar.number_input(
@@ -716,7 +739,8 @@ manual_quantity = st.sidebar.number_input(
     min_value=0.0,
     value=0.0,
     step=1.0,
-    format="%.4f"
+    format="%.4f",
+    key="manual_quantity_input"
 )
 
 manual_price = st.sidebar.number_input(
@@ -724,12 +748,13 @@ manual_price = st.sidebar.number_input(
     min_value=0.0,
     value=0.0,
     step=0.01,
-    format="%.3f"
+    format="%.3f",
+    key="manual_price_input"
 )
 
 st.sidebar.caption(
     "Se inserisci il prezzo manuale visto su Trade Republic, la webapp userà quello per calcolare guadagno/perdita. "
-    "Se lo lasci a zero, userà il prezzo automatico del ticker europeo."
+    "Se lo lasci a zero, userà il prezzo automatico del ticker europeo o il fallback USA convertito in euro."
 )
 
 
@@ -742,27 +767,26 @@ with st.spinner("Aggiorno prezzo, posizione, analisi tecnica e contesto di merca
     tf_data, tf_source = get_tf_data()
     market_context = build_market_context()
 
-    if auto_price is None:
-        st.error("Prezzo non disponibile. Verifica ticker o connessione dati.")
-        st.stop()
-
-    if not tf_data:
-        st.error("Dati tecnici non disponibili. Verifica ticker o connessione dati.")
-        st.stop()
-
     analyses = {}
 
-    for label, df in tf_data.items():
-        if df.empty or len(df) < 60:
-            st.error(f"Dati insufficienti per il timeframe {label}.")
-            st.stop()
+    if tf_data:
+        for label, df in tf_data.items():
+            if not df.empty and len(df) >= 60:
+                analyses[label] = analyze_timeframe(df, label)
 
-        analyses[label] = analyze_timeframe(df, label)
+    technical_available = all(label in analyses for label in ["15m", "30m", "1h", "4h", "1D"])
+    operational = build_operational_signal(analyses) if technical_available else None
 
-    operational = build_operational_signal(analyses)
 
-current_price = manual_price if manual_price > 0 else auto_price
-used_price_source = "Prezzo manuale Trade Republic" if manual_price > 0 else price_source
+if manual_price > 0:
+    current_price = manual_price
+    used_price_source = "Prezzo manuale Trade Republic"
+elif auto_price is not None:
+    current_price = auto_price
+    used_price_source = price_source
+else:
+    current_price = None
+    used_price_source = "Prezzo non disponibile"
 
 
 # =========================================================
@@ -776,11 +800,20 @@ st.markdown(
 )
 
 
+if current_price is None:
+    st.markdown("""
+    <div class="signal-box signal-yellow">
+        Il prezzo automatico non è disponibile in questo momento, probabilmente per rate limit di Yahoo Finance.
+        Inserisci il prezzo attuale che vedi su Trade Republic nel campo laterale per calcolare comunque la posizione.
+    </div>
+    """, unsafe_allow_html=True)
+
+
 # =========================================================
 # RISULTATO POSIZIONE
 # =========================================================
 
-if entry_price > 0 and capital > 0:
+if current_price is not None and entry_price > 0 and capital > 0:
     quantity = manual_quantity if manual_quantity > 0 else capital / entry_price
     current_value = quantity * current_price
     pnl_eur = current_value - capital
@@ -853,8 +886,8 @@ else:
 
     st.markdown("""
     <div class="signal-box signal-blue">
-        Inserisci nella barra laterale il prezzo medio di carico e il capitale investito. 
-        La webapp calcolerà automaticamente valore attuale, guadagno/perdita e performance.
+        Inserisci nella barra laterale prezzo medio di carico e capitale investito.
+        Se il prezzo automatico non è disponibile, inserisci anche il prezzo attuale visto su Trade Republic.
     </div>
     """, unsafe_allow_html=True)
 
@@ -865,34 +898,43 @@ else:
 
 st.markdown('<div class="section-title">Indicazione operativa</div>', unsafe_allow_html=True)
 
-combined_note = ""
+if operational is not None:
+    combined_note = ""
 
-if market_context["context"] == "SFAVOREVOLE" and operational["signal"] in ["LONG CONFERMATO", "LONG PRUDENTE"]:
-    combined_note = (
-        "<br><br><b>Nota di prudenza:</b> il titolo mostra segnali tecnici positivi, "
-        "ma il contesto di mercato non conferma ancora. Meglio ridurre la dimensione dell’operazione "
-        "o attendere una conferma più solida."
-    )
+    if market_context["context"] == "SFAVOREVOLE" and operational["signal"] in ["LONG CONFERMATO", "LONG PRUDENTE"]:
+        combined_note = (
+            "<br><br><b>Nota di prudenza:</b> il titolo mostra segnali tecnici positivi, "
+            "ma il contesto di mercato non conferma ancora. Meglio ridurre la dimensione dell’operazione "
+            "o attendere una conferma più solida."
+        )
 
-elif market_context["context"] == "FAVOREVOLE" and operational["signal"] in ["ATTENDERE", "NO LONG / RISCHIO RIBASSISTA"]:
-    combined_note = (
-        "<br><br><b>Nota:</b> il mercato sta migliorando, ma BBAI non ha ancora confermato tecnicamente. "
-        "Il contesto aiuta, ma il titolo deve comunque recuperare EMA20 su 1h e mostrare volumi in aumento."
-    )
+    elif market_context["context"] == "FAVOREVOLE" and operational["signal"] in ["ATTENDERE", "NO LONG / RISCHIO RIBASSISTA"]:
+        combined_note = (
+            "<br><br><b>Nota:</b> il mercato sta migliorando, ma BBAI non ha ancora confermato tecnicamente. "
+            "Il contesto aiuta, ma il titolo deve comunque recuperare EMA20 su 1h e mostrare volumi in aumento."
+        )
 
-elif market_context["context"] == "FAVOREVOLE" and operational["signal"] in ["LONG CONFERMATO", "LONG PRUDENTE"]:
-    combined_note = (
-        "<br><br><b>Conferma positiva:</b> il titolo e il mercato si stanno muovendo nella stessa direzione. "
-        "Il setup è più interessante, purché il prezzo non perda i supporti di breve."
-    )
+    elif market_context["context"] == "FAVOREVOLE" and operational["signal"] in ["LONG CONFERMATO", "LONG PRUDENTE"]:
+        combined_note = (
+            "<br><br><b>Conferma positiva:</b> il titolo e il mercato si stanno muovendo nella stessa direzione. "
+            "Il setup è più interessante, purché il prezzo non perda i supporti di breve."
+        )
 
-st.markdown(f"""
-<div class="signal-box {operational["css"]}">
-    <b>{safe_text(operational["signal"])}</b><br>
-    {safe_text(operational["action"])}
-    {combined_note}
-</div>
-""", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="signal-box {operational["css"]}">
+        <b>{safe_text(operational["signal"])}</b><br>
+        {safe_text(operational["action"])}
+        {combined_note}
+    </div>
+    """, unsafe_allow_html=True)
+
+else:
+    st.markdown("""
+    <div class="signal-box signal-yellow">
+        Analisi tecnica BBAI non disponibile in questo momento. Probabile rate limit o assenza temporanea di dati.
+        La parte posizione può comunque funzionare usando il prezzo manuale Trade Republic.
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # =========================================================
@@ -915,7 +957,7 @@ if not market_df.empty:
     st.dataframe(market_df_view, use_container_width=True, hide_index=True)
 
 st.caption(
-    "La lettura del contesto confronta BBAI con Nasdaq, small cap USA, ETF AI/robotics, difesa e volatilità. "
+    "La lettura del contesto confronta BBAI con Nasdaq, small cap USA, ETF AI/robotics, difesa e volatilità tramite VIXY. "
     "Serve a capire se il mercato sta favorendo o ostacolando il trade."
 )
 
@@ -924,131 +966,134 @@ st.caption(
 # LIVELLI OPERATIVI
 # =========================================================
 
-st.markdown('<div class="section-title">Livelli operativi dinamici</div>', unsafe_allow_html=True)
+if operational is not None:
+    st.markdown('<div class="section-title">Livelli operativi dinamici</div>', unsafe_allow_html=True)
 
-st.markdown(f"""
-<div class="card-grid-4">
-    <div class="card">
-        <div class="card-label">Supporto 1h</div>
-        <div class="card-value-small">{fmt_eur_3(analyses["1h"]["support"])}</div>
+    st.markdown(f"""
+    <div class="card-grid-4">
+        <div class="card">
+            <div class="card-label">Supporto 1h</div>
+            <div class="card-value-small">{fmt_eur_3(analyses["1h"]["support"])}</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Resistenza 1h</div>
+            <div class="card-value-small">{fmt_eur_3(analyses["1h"]["resistance"])}</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Stop dinamico ATR</div>
+            <div class="card-value-small">{fmt_eur_3(operational["stop"])}</div>
+        </div>
+        <div class="card">
+            <div class="card-label">Take Profit 1 / 2</div>
+            <div class="card-value-small">{fmt_eur_3(operational["tp1"])} / {fmt_eur_3(operational["tp2"])}</div>
+        </div>
     </div>
-    <div class="card">
-        <div class="card-label">Resistenza 1h</div>
-        <div class="card-value-small">{fmt_eur_3(analyses["1h"]["resistance"])}</div>
-    </div>
-    <div class="card">
-        <div class="card-label">Stop dinamico ATR</div>
-        <div class="card-value-small">{fmt_eur_3(operational["stop"])}</div>
-    </div>
-    <div class="card">
-        <div class="card-label">Take Profit 1 / 2</div>
-        <div class="card-value-small">{fmt_eur_3(operational["tp1"])} / {fmt_eur_3(operational["tp2"])}</div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
 
 # =========================================================
 # GRAFICO TECNICO
 # =========================================================
 
-st.markdown('<div class="section-title">Grafico tecnico 1h</div>', unsafe_allow_html=True)
+if technical_available:
+    st.markdown('<div class="section-title">Grafico tecnico 1h</div>', unsafe_allow_html=True)
 
-chart_df = analyses["1h"]["df"].tail(140)
+    chart_df = analyses["1h"]["df"].tail(140)
 
-fig = go.Figure()
+    fig = go.Figure()
 
-fig.add_trace(go.Candlestick(
-    x=chart_df.index,
-    open=chart_df["Open"],
-    high=chart_df["High"],
-    low=chart_df["Low"],
-    close=chart_df["Close"],
-    name="BBAI"
-))
+    fig.add_trace(go.Candlestick(
+        x=chart_df.index,
+        open=chart_df["Open"],
+        high=chart_df["High"],
+        low=chart_df["Low"],
+        close=chart_df["Close"],
+        name="BBAI"
+    ))
 
-fig.add_trace(go.Scatter(
-    x=chart_df.index,
-    y=chart_df["EMA20"],
-    mode="lines",
-    name="EMA20"
-))
+    fig.add_trace(go.Scatter(
+        x=chart_df.index,
+        y=chart_df["EMA20"],
+        mode="lines",
+        name="EMA20"
+    ))
 
-fig.add_trace(go.Scatter(
-    x=chart_df.index,
-    y=chart_df["EMA50"],
-    mode="lines",
-    name="EMA50"
-))
+    fig.add_trace(go.Scatter(
+        x=chart_df.index,
+        y=chart_df["EMA50"],
+        mode="lines",
+        name="EMA50"
+    ))
 
-fig.add_hline(
-    y=analyses["1h"]["support"],
-    line_dash="dash",
-    annotation_text="Supporto 1h",
-    annotation_position="bottom right"
-)
+    fig.add_hline(
+        y=analyses["1h"]["support"],
+        line_dash="dash",
+        annotation_text="Supporto 1h",
+        annotation_position="bottom right"
+    )
 
-fig.add_hline(
-    y=analyses["1h"]["resistance"],
-    line_dash="dash",
-    annotation_text="Resistenza 1h",
-    annotation_position="top right"
-)
+    fig.add_hline(
+        y=analyses["1h"]["resistance"],
+        line_dash="dash",
+        annotation_text="Resistenza 1h",
+        annotation_position="top right"
+    )
 
-fig.update_layout(
-    height=620,
-    xaxis_rangeslider_visible=False,
-    margin=dict(l=20, r=20, t=40, b=20),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
-)
+    fig.update_layout(
+        height=620,
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=20, r=20, t=40, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
+    )
 
-st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # =========================================================
 # ANALISI MULTI-TIMEFRAME
 # =========================================================
 
-st.markdown('<div class="section-title">Analisi tecnica multi-timeframe</div>', unsafe_allow_html=True)
+if technical_available:
+    st.markdown('<div class="section-title">Analisi tecnica multi-timeframe</div>', unsafe_allow_html=True)
 
-summary_rows = []
+    summary_rows = []
 
-for label in ["15m", "30m", "1h", "4h", "1D"]:
-    tf = analyses[label]
+    for label in ["15m", "30m", "1h", "4h", "1D"]:
+        tf = analyses[label]
 
-    summary_rows.append({
-        "Timeframe": label,
-        "Trend": tf["trend"],
-        "RSI": round(tf["rsi"], 1),
-        "Stato RSI": tf["rsi_state"],
-        "MACD": tf["macd"],
-        "Volumi": tf["volume"],
-        "Supporto": fmt_eur_3(tf["support"]),
-        "Resistenza": fmt_eur_3(tf["resistance"]),
-        "Forza tecnica": f'{tf["score"]}/5'
-    })
+        summary_rows.append({
+            "Timeframe": label,
+            "Trend": tf["trend"],
+            "RSI": round(tf["rsi"], 1),
+            "Stato RSI": tf["rsi_state"],
+            "MACD": tf["macd"],
+            "Volumi": tf["volume"],
+            "Supporto": fmt_eur_3(tf["support"]),
+            "Resistenza": fmt_eur_3(tf["resistance"]),
+            "Forza tecnica": f'{tf["score"]}/5'
+        })
 
-st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-for label in ["15m", "30m", "1h", "4h", "1D"]:
-    tf = analyses[label]
+    for label in ["15m", "30m", "1h", "4h", "1D"]:
+        tf = analyses[label]
 
-    with st.expander(f"Dettaglio timeframe {label}"):
-        c1, c2, c3 = st.columns(3)
+        with st.expander(f"Dettaglio timeframe {label}"):
+            c1, c2, c3 = st.columns(3)
 
-        c1.write(f"**Prezzo:** {fmt_eur_3(tf['price'])}")
-        c1.write(f"**Trend:** {tf['trend']}")
-        c1.write(f"**EMA20:** {fmt_eur_3(tf['ema20'])}")
-        c1.write(f"**EMA50:** {fmt_eur_3(tf['ema50'])}")
+            c1.write(f"**Prezzo:** {fmt_eur_3(tf['price'])}")
+            c1.write(f"**Trend:** {tf['trend']}")
+            c1.write(f"**EMA20:** {fmt_eur_3(tf['ema20'])}")
+            c1.write(f"**EMA50:** {fmt_eur_3(tf['ema50'])}")
 
-        c2.write(f"**RSI 14:** {tf['rsi']:.1f} – {tf['rsi_state']}")
-        c2.write(f"**MACD:** {tf['macd']}")
-        c2.write(f"**Volumi:** {tf['volume']}")
+            c2.write(f"**RSI 14:** {tf['rsi']:.1f} – {tf['rsi_state']}")
+            c2.write(f"**MACD:** {tf['macd']}")
+            c2.write(f"**Volumi:** {tf['volume']}")
 
-        c3.write(f"**Supporto:** {fmt_eur_3(tf['support'])}")
-        c3.write(f"**Resistenza:** {fmt_eur_3(tf['resistance'])}")
-        c3.write(f"**ATR:** {fmt_eur_3(tf['atr'])}")
-        c3.write(f"**Forza tecnica:** {tf['score']}/5")
+            c3.write(f"**Supporto:** {fmt_eur_3(tf['support'])}")
+            c3.write(f"**Resistenza:** {fmt_eur_3(tf['resistance'])}")
+            c3.write(f"**ATR:** {fmt_eur_3(tf['atr'])}")
+            c3.write(f"**Forza tecnica:** {tf['score']}/5")
 
 
 # =========================================================
@@ -1057,7 +1102,7 @@ for label in ["15m", "30m", "1h", "4h", "1D"]:
 
 st.caption(
     f"Ultimo aggiornamento: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')} — "
-    f"Fonte tecnica: {tf_source}. "
+    f"Fonte tecnica: {tf_source if 'tf_source' in globals() else 'non disponibile'}. "
     "La fonte automatica usa il ticker europeo 28K1.F quando disponibile. "
     "Per la massima aderenza a Trade Republic puoi inserire manualmente il prezzo attuale visto sul broker. "
     "Le indicazioni sono basate su analisi tecnica e non costituiscono consulenza finanziaria personalizzata."
